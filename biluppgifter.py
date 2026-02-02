@@ -23,13 +23,19 @@ class CookieManager:
         self.cookies = {}
         self.last_refresh = 0
         self.lock = threading.Lock()
-        self.min_refresh_interval = 60  # Minst 60 sek mellan refreshes
+        self.min_refresh_interval = 30  # Minst 30 sek mellan refreshes
+        # Ladda env cookies direkt vid start
+        self.cookies = {
+            'theme': 'dark',
+            'session': os.getenv('BILUPPGIFTER_SESSION', ''),
+            'cf_clearance': os.getenv('BILUPPGIFTER_CF_CLEARANCE', ''),
+            '.AspNetCore.Antiforgery.KXUQR4SkAeM': os.getenv('BILUPPGIFTER_ANTIFORGERY', ''),
+        }
+        print(f"[CookieManager] Initialized with env cookies")
 
     def get_cookies(self) -> dict:
-        """Hämta giltiga cookies, refresha om nödvändigt."""
+        """Hämta giltiga cookies."""
         with self.lock:
-            if not self.cookies:
-                self._refresh_cookies()
             return self.cookies.copy()
 
     def force_refresh(self):
@@ -54,6 +60,7 @@ class CookieManager:
                         '--disable-blink-features=AutomationControlled',
                         '--disable-dev-shm-usage',
                         '--no-sandbox',
+                        '--disable-setuid-sandbox',
                     ]
                 )
 
@@ -68,50 +75,81 @@ class CookieManager:
                     Object.defineProperty(navigator, 'webdriver', {
                         get: () => undefined
                     });
+                    // Ytterligare stealth
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5]
+                    });
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['sv-SE', 'sv', 'en-US', 'en']
+                    });
+                    window.chrome = { runtime: {} };
                 """)
 
                 page = context.new_page()
 
-                # Navigera till biluppgifter.se
+                # Navigera till en specifik fordonssida för att få alla cookies
                 print("[CookieManager] Navigating to biluppgifter.se...")
-                page.goto('https://biluppgifter.se/', wait_until='networkidle', timeout=30000)
+                page.goto('https://biluppgifter.se/fordon/abc123/', wait_until='domcontentloaded', timeout=30000)
 
-                # Vänta på att Cloudflare-challenge löses
-                time.sleep(3)
+                # Vänta på att sidan laddas helt
+                time.sleep(5)
 
-                # Kolla om vi fortfarande är på Cloudflare
-                if 'challenge' in page.url or 'cloudflare' in page.content().lower():
+                # Kolla om vi är på Cloudflare-challenge
+                content = page.content().lower()
+                if 'challenge' in page.url or 'just a moment' in content or 'checking your browser' in content:
                     print("[CookieManager] Waiting for Cloudflare challenge...")
-                    page.wait_for_load_state('networkidle', timeout=15000)
-                    time.sleep(2)
+                    page.wait_for_load_state('networkidle', timeout=20000)
+                    time.sleep(5)
 
                 # Extrahera cookies
                 cookies = context.cookies()
-                self.cookies = {
-                    'theme': 'dark',
-                }
+                new_cookies = {'theme': 'dark'}
 
                 for cookie in cookies:
                     name = cookie['name']
                     value = cookie['value']
+                    # Spara alla potentiellt användbara cookies
                     if name in ['session', 'cf_clearance', '.AspNetCore.Antiforgery.KXUQR4SkAeM']:
-                        self.cookies[name] = value
-                        print(f"[CookieManager] Got cookie: {name[:20]}...")
+                        new_cookies[name] = value
+                        print(f"[CookieManager] Got cookie: {name[:30]}...")
 
-                self.last_refresh = time.time()
                 browser.close()
 
-                print(f"[CookieManager] Cookies refreshed successfully! Got {len(self.cookies)} cookies")
+                # Kontrollera om vi fick cf_clearance (viktigast för Cloudflare)
+                if 'cf_clearance' in new_cookies:
+                    # Behåll session/antiforgery från env om de saknas
+                    if 'session' not in new_cookies:
+                        env_session = os.getenv('BILUPPGIFTER_SESSION', '')
+                        if env_session:
+                            new_cookies['session'] = env_session
+                            print("[CookieManager] Using session from env")
+                    if '.AspNetCore.Antiforgery.KXUQR4SkAeM' not in new_cookies:
+                        env_antiforgery = os.getenv('BILUPPGIFTER_ANTIFORGERY', '')
+                        if env_antiforgery:
+                            new_cookies['.AspNetCore.Antiforgery.KXUQR4SkAeM'] = env_antiforgery
+                            print("[CookieManager] Using antiforgery from env")
+
+                    self.cookies = new_cookies
+                    self.last_refresh = time.time()
+                    print(f"[CookieManager] Cookies refreshed! Got {len(self.cookies)} cookies")
+                else:
+                    print("[CookieManager] Failed to get cf_clearance, using env fallback")
+                    self._use_env_cookies()
 
         except Exception as e:
             print(f"[CookieManager] Error refreshing cookies: {e}")
-            # Fallback till env-variabler om Playwright misslyckas
-            self.cookies = {
-                'theme': 'dark',
-                'session': os.getenv('BILUPPGIFTER_SESSION', ''),
-                'cf_clearance': os.getenv('BILUPPGIFTER_CF_CLEARANCE', ''),
-                '.AspNetCore.Antiforgery.KXUQR4SkAeM': os.getenv('BILUPPGIFTER_ANTIFORGERY', ''),
-            }
+            self._use_env_cookies()
+
+    def _use_env_cookies(self):
+        """Använd cookies från miljövariabler som fallback."""
+        self.cookies = {
+            'theme': 'dark',
+            'session': os.getenv('BILUPPGIFTER_SESSION', ''),
+            'cf_clearance': os.getenv('BILUPPGIFTER_CF_CLEARANCE', ''),
+            '.AspNetCore.Antiforgery.KXUQR4SkAeM': os.getenv('BILUPPGIFTER_ANTIFORGERY', ''),
+        }
+        self.last_refresh = time.time()
+        print("[CookieManager] Using env cookies as fallback")
 
 
 # Global cookie manager
@@ -150,6 +188,8 @@ class BiluppgifterClient:
                     self._retry_count += 1
                     print(f"[BiluppgifterClient] Got 403, refreshing cookies (attempt {self._retry_count})...")
                     cookie_manager.force_refresh()
+                    # Vänta lite så Playwright hinner köra klart
+                    time.sleep(2)
                     return self._fetch_page(path)  # Retry
                 else:
                     self._retry_count = 0
