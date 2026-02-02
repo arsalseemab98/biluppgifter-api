@@ -1,48 +1,172 @@
 """
-Biluppgifter.se API Client
-Hämtar fordonsdata via curl_cffi (Chrome TLS impersonation) + HTML-parsing.
+Biluppgifter.se API Client - Hybrid Version
+Använder Playwright för Cloudflare-bypass + curl_cffi för snabb datahämtning.
 """
 
 import os
 import re
 import json
+import time
+import threading
 from curl_cffi import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
+class CookieManager:
+    """Hanterar cookies automatiskt med Playwright."""
+
+    def __init__(self):
+        self.cookies = {}
+        self.last_refresh = 0
+        self.lock = threading.Lock()
+        self.min_refresh_interval = 60  # Minst 60 sek mellan refreshes
+
+    def get_cookies(self) -> dict:
+        """Hämta giltiga cookies, refresha om nödvändigt."""
+        with self.lock:
+            if not self.cookies:
+                self._refresh_cookies()
+            return self.cookies.copy()
+
+    def force_refresh(self):
+        """Tvinga cookie-refresh (t.ex. efter 403)."""
+        with self.lock:
+            now = time.time()
+            if now - self.last_refresh < self.min_refresh_interval:
+                print(f"[CookieManager] Skipping refresh, last was {int(now - self.last_refresh)}s ago")
+                return
+            self._refresh_cookies()
+
+    def _refresh_cookies(self):
+        """Öppna Playwright och hämta nya cookies."""
+        print("[CookieManager] Refreshing cookies with Playwright...")
+
+        try:
+            with sync_playwright() as p:
+                # Starta browser med stealth-inställningar
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-dev-shm-usage',
+                        '--no-sandbox',
+                    ]
+                )
+
+                context = browser.new_context(
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    viewport={'width': 1920, 'height': 1080},
+                    locale='sv-SE',
+                )
+
+                # Ta bort webdriver-flaggan
+                context.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                """)
+
+                page = context.new_page()
+
+                # Navigera till biluppgifter.se
+                print("[CookieManager] Navigating to biluppgifter.se...")
+                page.goto('https://biluppgifter.se/', wait_until='networkidle', timeout=30000)
+
+                # Vänta på att Cloudflare-challenge löses
+                time.sleep(3)
+
+                # Kolla om vi fortfarande är på Cloudflare
+                if 'challenge' in page.url or 'cloudflare' in page.content().lower():
+                    print("[CookieManager] Waiting for Cloudflare challenge...")
+                    page.wait_for_load_state('networkidle', timeout=15000)
+                    time.sleep(2)
+
+                # Extrahera cookies
+                cookies = context.cookies()
+                self.cookies = {
+                    'theme': 'dark',
+                }
+
+                for cookie in cookies:
+                    name = cookie['name']
+                    value = cookie['value']
+                    if name in ['session', 'cf_clearance', '.AspNetCore.Antiforgery.KXUQR4SkAeM']:
+                        self.cookies[name] = value
+                        print(f"[CookieManager] Got cookie: {name[:20]}...")
+
+                self.last_refresh = time.time()
+                browser.close()
+
+                print(f"[CookieManager] Cookies refreshed successfully! Got {len(self.cookies)} cookies")
+
+        except Exception as e:
+            print(f"[CookieManager] Error refreshing cookies: {e}")
+            # Fallback till env-variabler om Playwright misslyckas
+            self.cookies = {
+                'theme': 'dark',
+                'session': os.getenv('BILUPPGIFTER_SESSION', ''),
+                'cf_clearance': os.getenv('BILUPPGIFTER_CF_CLEARANCE', ''),
+                '.AspNetCore.Antiforgery.KXUQR4SkAeM': os.getenv('BILUPPGIFTER_ANTIFORGERY', ''),
+            }
+
+
+# Global cookie manager
+cookie_manager = CookieManager()
+
+
 class BiluppgifterClient:
+    """Biluppgifter.se client med automatisk cookie-hantering."""
+
     BASE_URL = "https://biluppgifter.se"
 
-    def __init__(self, session_cookie=None, cf_clearance=None, antiforgery=None):
-        self.cookies = {
-            "theme": "dark",
-            "session": session_cookie or os.getenv("BILUPPGIFTER_SESSION", ""),
-            "cf_clearance": cf_clearance or os.getenv("BILUPPGIFTER_CF_CLEARANCE", ""),
-            ".AspNetCore.Antiforgery.KXUQR4SkAeM": antiforgery or os.getenv("BILUPPGIFTER_ANTIFORGERY", ""),
-        }
+    def __init__(self):
         self.headers = {
             "referer": f"{self.BASE_URL}/",
-            "accept-language": "en-GB,en;q=0.9,sv-GB;q=0.8,sv;q=0.7",
+            "accept-language": "sv-SE,sv;q=0.9,en;q=0.8",
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
+        self._retry_count = 0
+        self._max_retries = 2
 
     def _fetch_page(self, path: str) -> str:
-        r = requests.get(
-            f"{self.BASE_URL}{path}",
-            impersonate="chrome",
-            cookies=self.cookies,
-            headers=self.headers,
-        )
-        if r.status_code == 403:
-            raise PermissionError(
-                "Cloudflare blockerade requesten. "
-                "Uppdatera cf_clearance-cookien från Chrome."
+        """Hämta sida med curl_cffi, auto-refresh cookies vid behov."""
+        cookies = cookie_manager.get_cookies()
+
+        try:
+            r = requests.get(
+                f"{self.BASE_URL}{path}",
+                impersonate="chrome",
+                cookies=cookies,
+                headers=self.headers,
+                timeout=15,
             )
-        if r.status_code != 200:
-            raise ConnectionError(f"HTTP {r.status_code} från biluppgifter.se")
-        return r.text
+
+            if r.status_code == 403:
+                if self._retry_count < self._max_retries:
+                    self._retry_count += 1
+                    print(f"[BiluppgifterClient] Got 403, refreshing cookies (attempt {self._retry_count})...")
+                    cookie_manager.force_refresh()
+                    return self._fetch_page(path)  # Retry
+                else:
+                    self._retry_count = 0
+                    raise PermissionError(
+                        "Cloudflare blockerade requesten efter flera försök. "
+                        "Testa igen om en stund."
+                    )
+
+            self._retry_count = 0  # Reset on success
+
+            if r.status_code != 200:
+                raise ConnectionError(f"HTTP {r.status_code} från biluppgifter.se")
+
+            return r.text
+
+        except requests.exceptions.Timeout:
+            raise ConnectionError("Timeout vid anslutning till biluppgifter.se")
 
     # ── Parsers ──────────────────────────────────────────────
 
@@ -246,36 +370,26 @@ class BiluppgifterClient:
             regnr_match = re.search(r"/fordon/([a-zA-Z0-9]+)", link["href"])
             regnr = regnr_match.group(1).upper() if regnr_match else ""
             model = link.get_text(strip=True)
-            # Extrahera extra fält från celler
             entry = {"regnr": regnr, "model": model}
-
-            # Parse all table cells in order
-            # Columns: Märke/Modell (colspan 3), Regnr, Färg, Typ, Modellår, Införskaffad
-            cell_texts = [td.get_text(strip=True) for td in cells]
 
             for i, td in enumerate(cells):
                 text = td.get_text(strip=True)
 
-                # Regnr (usually has mono class)
                 if "mono" in td.get("class", []):
                     entry["regnr"] = text.upper()
 
-                # Färg (color div)
                 color_div = td.find("div", class_="color")
                 if color_div:
                     entry["color"] = text
 
-                # Modellår (4-digit year)
                 if re.match(r"^\d{4}$", text):
                     entry["year"] = int(text)
 
-                # Införskaffad (date like YYYY-MM-DD or YYYY-MM, or "X år sedan")
                 if re.match(r"^\d{4}-\d{2}(-\d{2})?$", text):
                     entry["date_acquired"] = text
                 elif "år sedan" in text or "mån sedan" in text:
                     entry["ownership_time"] = text
 
-            # Status från rad-klass
             row_classes = row.get("class", [])
             if "itrafik" in row_classes:
                 entry["status"] = "I Trafik"
@@ -299,7 +413,6 @@ class BiluppgifterClient:
         if not meter_section:
             return history
 
-        # Find all besiktning entries: <h3>Besiktning<span class="numb">15 978 mil<em>2025-10-14</em></span></h3>
         for h3 in meter_section.find_all("h3"):
             text = h3.get_text(strip=True)
             if not text.startswith("Besiktning"):
@@ -310,7 +423,6 @@ class BiluppgifterClient:
                 continue
 
             span_text = span.get_text(strip=True)
-            # Parse: "15 978 mil2025-10-14"
             match = re.match(r"([\d\s]+)\s*mil(\d{4}-\d{2}-\d{2})", span_text)
             if match:
                 mileage_str = match.group(1).replace(" ", "")
@@ -352,16 +464,15 @@ class BiluppgifterClient:
             **self._parse_owner_profile(soup),
         }
 
-        # Hämta fordon via HTMX (laddas dynamiskt)
         try:
             result["vehicles"] = self._fetch_htmx_vehicles(profile_path, profile_id)
         except Exception:
-            pass  # Behåll tom lista om HTMX-anropet misslyckas
+            pass
 
         return result
 
     def lookup_owner_by_regnr(self, regnr: str) -> dict:
-        """Hämta ägarprofil via registreringsnummer (fordon → ägare → profil)."""
+        """Hämta ägarprofil via registreringsnummer."""
         vehicle = self.lookup(regnr)
         owner = vehicle.get("owner", {})
         current = owner.get("current_owner", {})
@@ -382,7 +493,7 @@ class BiluppgifterClient:
         }
 
     def lookup_address_vehicles(self, regnr: str) -> dict:
-        """Hämta alla fordon registrerade på samma adress som fordonets ägare."""
+        """Hämta alla fordon registrerade på samma adress."""
         owner_data = self.lookup_owner_by_regnr(regnr)
         profile = owner_data.get("owner_profile", {})
 
@@ -407,18 +518,28 @@ if __name__ == "__main__":
   python biluppgifter.py owner <regnr>           Ägarinfo via regnr
   python biluppgifter.py profile <profile_id>    Ägarprofil direkt
   python biluppgifter.py address <regnr>         Alla fordon på ägarens adress
+  python biluppgifter.py refresh                 Tvinga cookie-refresh
 
 Exempel:
   python biluppgifter.py vehicle XBD134
-  python biluppgifter.py owner XBD134
-  python biluppgifter.py address XBD134"""
+  python biluppgifter.py refresh"""
+
+    if len(sys.argv) < 2:
+        print(USAGE)
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+
+    if cmd == "refresh":
+        cookie_manager.force_refresh()
+        print("Cookies refreshed!")
+        sys.exit(0)
 
     if len(sys.argv) < 3:
         print(USAGE)
         sys.exit(1)
 
     client = BiluppgifterClient()
-    cmd = sys.argv[1]
     arg = sys.argv[2]
 
     try:
