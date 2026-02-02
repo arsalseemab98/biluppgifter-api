@@ -17,7 +17,9 @@ load_dotenv()
 
 
 class CookieManager:
-    """Hanterar cookies automatiskt med Playwright."""
+    """Hanterar cookies automatiskt med Playwright och persistent profile."""
+
+    PROFILE_DIR = '/opt/biluppgifter-api/browser_profile'
 
     def __init__(self):
         self.cookies = {}
@@ -25,13 +27,18 @@ class CookieManager:
         self.lock = threading.Lock()
         self.min_refresh_interval = 30  # Minst 30 sek mellan refreshes
         # Ladda env cookies direkt vid start
+        self._load_env_cookies()
+        print(f"[CookieManager] Initialized with {len(self.cookies)} cookies")
+
+    def _load_env_cookies(self):
+        """Ladda cookies från .env fil."""
+        load_dotenv(override=True)  # Reload .env
         self.cookies = {
             'theme': 'dark',
             'session': os.getenv('BILUPPGIFTER_SESSION', ''),
             'cf_clearance': os.getenv('BILUPPGIFTER_CF_CLEARANCE', ''),
             '.AspNetCore.Antiforgery.KXUQR4SkAeM': os.getenv('BILUPPGIFTER_ANTIFORGERY', ''),
         }
-        print(f"[CookieManager] Initialized with env cookies")
 
     def get_cookies(self) -> dict:
         """Hämta giltiga cookies."""
@@ -48,108 +55,11 @@ class CookieManager:
             self._refresh_cookies()
 
     def _refresh_cookies(self):
-        """Öppna Playwright och hämta nya cookies."""
-        print("[CookieManager] Refreshing cookies with Playwright...")
-
-        try:
-            with sync_playwright() as p:
-                # Starta browser med stealth-inställningar
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=[
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-dev-shm-usage',
-                        '--no-sandbox',
-                        '--disable-setuid-sandbox',
-                    ]
-                )
-
-                context = browser.new_context(
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    viewport={'width': 1920, 'height': 1080},
-                    locale='sv-SE',
-                )
-
-                # Ta bort webdriver-flaggan
-                context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    });
-                    // Ytterligare stealth
-                    Object.defineProperty(navigator, 'plugins', {
-                        get: () => [1, 2, 3, 4, 5]
-                    });
-                    Object.defineProperty(navigator, 'languages', {
-                        get: () => ['sv-SE', 'sv', 'en-US', 'en']
-                    });
-                    window.chrome = { runtime: {} };
-                """)
-
-                page = context.new_page()
-
-                # Navigera till en specifik fordonssida för att få alla cookies
-                print("[CookieManager] Navigating to biluppgifter.se...")
-                page.goto('https://biluppgifter.se/fordon/abc123/', wait_until='domcontentloaded', timeout=30000)
-
-                # Vänta på att sidan laddas helt
-                time.sleep(5)
-
-                # Kolla om vi är på Cloudflare-challenge
-                content = page.content().lower()
-                if 'challenge' in page.url or 'just a moment' in content or 'checking your browser' in content:
-                    print("[CookieManager] Waiting for Cloudflare challenge...")
-                    page.wait_for_load_state('networkidle', timeout=20000)
-                    time.sleep(5)
-
-                # Extrahera cookies
-                cookies = context.cookies()
-                new_cookies = {'theme': 'dark'}
-
-                for cookie in cookies:
-                    name = cookie['name']
-                    value = cookie['value']
-                    # Spara alla potentiellt användbara cookies
-                    if name in ['session', 'cf_clearance', '.AspNetCore.Antiforgery.KXUQR4SkAeM']:
-                        new_cookies[name] = value
-                        print(f"[CookieManager] Got cookie: {name[:30]}...")
-
-                browser.close()
-
-                # Kontrollera om vi fick cf_clearance (viktigast för Cloudflare)
-                if 'cf_clearance' in new_cookies:
-                    # Behåll session/antiforgery från env om de saknas
-                    if 'session' not in new_cookies:
-                        env_session = os.getenv('BILUPPGIFTER_SESSION', '')
-                        if env_session:
-                            new_cookies['session'] = env_session
-                            print("[CookieManager] Using session from env")
-                    if '.AspNetCore.Antiforgery.KXUQR4SkAeM' not in new_cookies:
-                        env_antiforgery = os.getenv('BILUPPGIFTER_ANTIFORGERY', '')
-                        if env_antiforgery:
-                            new_cookies['.AspNetCore.Antiforgery.KXUQR4SkAeM'] = env_antiforgery
-                            print("[CookieManager] Using antiforgery from env")
-
-                    self.cookies = new_cookies
-                    self.last_refresh = time.time()
-                    print(f"[CookieManager] Cookies refreshed! Got {len(self.cookies)} cookies")
-                else:
-                    print("[CookieManager] Failed to get cf_clearance, using env fallback")
-                    self._use_env_cookies()
-
-        except Exception as e:
-            print(f"[CookieManager] Error refreshing cookies: {e}")
-            self._use_env_cookies()
-
-    def _use_env_cookies(self):
-        """Använd cookies från miljövariabler som fallback."""
-        self.cookies = {
-            'theme': 'dark',
-            'session': os.getenv('BILUPPGIFTER_SESSION', ''),
-            'cf_clearance': os.getenv('BILUPPGIFTER_CF_CLEARANCE', ''),
-            '.AspNetCore.Antiforgery.KXUQR4SkAeM': os.getenv('BILUPPGIFTER_ANTIFORGERY', ''),
-        }
+        """Ladda om cookies från .env (som uppdateras av keep_alive.py)."""
+        print("[CookieManager] Reloading cookies from .env...")
+        self._load_env_cookies()
         self.last_refresh = time.time()
-        print("[CookieManager] Using env cookies as fallback")
+        print(f"[CookieManager] Cookies reloaded! Got {len([k for k,v in self.cookies.items() if v])} active cookies")
 
 
 # Global cookie manager
